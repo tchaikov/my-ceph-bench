@@ -133,32 +133,5 @@ plot_workload("read",      "Bandwidth MB/s (log)",            lambda i, b: b/102
 plot_workload("write",     "Bandwidth MB/s (log)",            lambda i, b: b/1024/1024, "04-seqwrite-64k.png","64K sequential write — latency vs bandwidth")
 
 
-# === Headline: pre/post 0025 fix on the same workload ===
-fig, ax = plt.subplots(figsize=(10, 5.5))
-labels = [
-    "pre-patch\nauthor-spec\n(QD20 nj1 180s, in VM)\nbug-bottlenecked",
-    "post-patch\nhost-fio soak\n(QD16 nj1 600s)\n10-min validated",
-    "post-patch\ntiny-bench\n(QD8 nj1 30s)\nburst",
-]
-ips = [962, 1692, 67404]
-crashed = [True, False, False]
-colors = ["#c62828" if c else "#2e7d32" for c in crashed]
-
-bars = ax.bar(labels, ips, color=colors, edgecolor="black", linewidth=0.6)
-for bar, val, c in zip(bars, ips, crashed):
-    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
-            f"{val:,} IOPS" + ("\n(OSD crashed)" if c else "\n(0 crashes)"),
-            ha="center", va="bottom", fontsize=10,
-            color=("#c62828" if c else "#1b5e20"), fontweight="bold")
-ax.set_yscale("log")
-ax.set_ylabel("Sustained IOPS (log)")
-ax.set_title("4K randwrite throughput on Crimson + SeaStore + RBM:\n"
-             "before vs after the CBJournal length_error fix (patches/0025)")
-ax.grid(axis="y", which="both", linestyle=":", alpha=0.4)
-ax.set_ylim(top=ips[-1] * 1.5)
-fig.tight_layout()
-fig.savefig(OUT_DIR / "05-headline-0025-validation.png", dpi=120)
-plt.close(fig)
-print(f"  wrote {OUT_DIR / '05-headline-0025-validation.png'}")
 
 print(f"\nAll charts written to {OUT_DIR}")

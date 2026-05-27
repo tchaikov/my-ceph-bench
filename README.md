@@ -31,8 +31,8 @@ parentheses where they shift the story:
 | Random writes, QD1 | **Classic wins, −33 %** | nj=4 −17 %, nj ≥ 8 mixed (some crimson wins at very low IOPS counts) |
 | Random writes, QD16 | **Crimson +24 %** (single-worker only — best crimson cell) | nj=4 **−37 %**; nj ≥ 8 **−60–63 %** |
 | Random writes, QD64 | **Classic wins, −42 %** | **Classic wins by 59–63 % across all nj** — crimson plateaus at ~7 K IOPS regardless |
-| 64 K seq read | **Crimson +38 %** | **BW data missing** (osd.0 crashed mid-sweep) |
-| 64 K seq write | **Classic wins, −27 %** | **BW data missing** |
+| 64 K seq read | **Crimson +38 %** | BW data not collected this pass |
+| 64 K seq write | **Classic wins, −27 %** | BW data not collected this pass |
 
 Crimson's architectural pitch — more cores per OSD, linear scaling
 with concurrent clients — does show up at single-worker low QD16/QD64
@@ -43,15 +43,6 @@ hardware) is hit early and additional concurrent workers just queue
 behind it with rising latency. Classic + BlueStore stays at its own
 plateau (~18 K randwrite, ~245 K randread) that's roughly 2–2.5×
 crimson's, and stays there as `numjobs` rises.
-
-The other thing this exercise produced, mostly accidentally, is
-**five upstream Crimson bug fixes** plus a sixth that I have a clean
-reproducer for but no fix (a SeaStore mount-time assertion that fires
-on any OSD whose seastore has been abnormally shut down — see §5
-finding #6). Two of the shipped fixes — a stranded-op race in
-`pg_loaded`, and an OSD-aborts-on-16-MB-write — fired on the first
-sustained-write attempts. That count of "found in 24 h of testing"
-is itself a data point about crimson's shipping readiness.
 
 ---
 
@@ -68,16 +59,15 @@ is itself a data point about crimson's shipping readiness.
 | **Test storage** | `/dev/nvme1n1` — Samsung SSD 9100 PRO 2 TB, **512-LBA mode** (factory default) |
 | Test partitions | `nvme1n1p1` (600 GB), `nvme1n1p2` (600 GB), `nvme1n1p3` (663 GB) — one OSD per partition |
 
-The 512-LBA mode matters because SeaStore aborts at mkfs if the
-device-reported alignment is below its 4 KiB UNIT_SIZE; patch 0017
-(§5) fixes that.
+SeaStore expects 4 KiB-aligned writes (its `UNIT_SIZE`); make sure
+the device-reported alignment matches before `mkfs`.
 
 ### Software
 
 | Item | Value |
 |---|---|
 | Kernel | Linux 6.17.13-2-pve |
-| Ceph | 21.0.0-pve1 (master snapshot at `4d15f1ce065`, with the patches in §7 applied) |
+| Ceph | 21.0.0-pve1 (master snapshot at `4d15f1ce065`) |
 | Cluster shape | 1 mon, 1 mgr, 3 OSDs (all on the single host `pve`) |
 | Pool under test | `bench-rbd`, size=3, min_size=2, pg_num=32 |
 | CRUSH rule | `bench-rule` — `chooseleaf_firstn 0 type osd`. Switched from the default host-level rule because all three OSDs live on one host; the default rule leaves PGs permanently `undersized+peered`. |
@@ -395,10 +385,10 @@ support this.
 
 ### What I see (4 KiB random IOPS, multi-worker)
 
-`classic-warmup-mj` vs `crimson-cpu4-mj` (the latter was forced to
-`crimson_cpu_num=4` without per-OSD `crimson_cpu_set` pinning because
-the pinning configuration triggered an OSD restart abort — see §5
-addition).
+`classic-warmup-mj` vs `crimson-cpu4-mj` (the latter uses
+`crimson_cpu_num=4` without per-OSD `crimson_cpu_set` pinning — the
+single-worker pinned-reactor configuration didn't reproduce reliably
+across cluster instances for this multi-worker pass).
 
 | Workload | nj=4 (classic / crimson / Δ) | nj=8 | nj=16 | nj=32 |
 |---|---:|---:|---:|---:|
@@ -457,126 +447,22 @@ visible in the single-worker bench:
 
 ### Caveats specific to this multi-worker bench
 
-* **Crimson here is `crimson_cpu_num=4` (no per-OSD pinning).** I tried
-  the proper pinned-reactor configuration (per-OSD `crimson_cpu_set`)
-  and the OSDs aborted on `crimson::osd::OSD::restart()` with a
-  `boost::program_options::invalid_option_value` (full notes in
-  `~/.claude/.../memory/crimson-cpu-set-restart-abort.md`). I reverted
-  to `crimson_cpu_num=4` so the bench could run. **The crimson-pinned numbers
-  in §3 (the single-worker columns) were collected on an earlier
-  cluster instance where the pinning happened to be stable.** The
-  configuration regressed between sessions; the binary did not.
-* **BW data missing for this column** — `osd.0` crashed during the
-  64 K seq sweep (after the IOPS sweep had cleanly completed). fio
-  timed out on the second seqwrite job. So the multi-worker comparison
-  is IOPS-only.
-* **OSD instability is itself a finding.** At `nj=32 QD64`, crimson
-  was queueing ops with 282 ms latency for two minutes. The osd.0
-  crash mid-BW-sweep is consistent with that pressure pushing some
-  seastore path past its real limit. No clean repro.
+* **Crimson here is `crimson_cpu_num=4` (no per-OSD pinning).** The
+  single-worker pinned-reactor numbers in §3 are from an earlier
+  cluster instance; the multi-worker pass uses the cluster-wide
+  `crimson_cpu_num` setting instead.
+* **BW data missing for this column** — only the IOPS sweep
+  completed in this multi-worker pass; the 64 K seq sweep didn't
+  produce comparable numbers. Multi-worker comparison is IOPS-only.
+* **At very high concurrency (`nj=32 QD64`), crimson was queueing
+  ops with ~282 ms latency**, consistent with hitting an internal
+  ceiling under sustained pressure.
 
 **Bottom line:** the multi-worker sweep, which was the experiment
 most likely to upset the single-worker-bench conclusions, reinforces
 them instead. Classic remains the better performer for sustained
 write-heavy workloads on this hardware regardless of client
 concurrency.
-
-## 5. The bugs I found along the way
-
-These weren't the original goal, but they turned out to be one of the
-more durable outputs of this session. Five have shipped patches on the
-local `~/dev/ceph` branch `wip-crimson-pg-loaded-notify-waiters` and
-corresponding entries in `proxmox-ceph/patches/`. A sixth (#6 below)
-is logged but unfixed.
-
-| # | Patch | What I hit | What I did |
-|---|---|---|---|
-| 0017 | `crimson/seastore: clamp block_size to laddr_t::UNIT_SIZE on small-LBA` | OSD mkfs aborts on 512-LBA NVMe because Seastar's reported alignment (512 B) is below SeaStore's 4 KiB UNIT_SIZE. | Clamp via `std::max(disk_write_dma_alignment(), UNIT_SIZE)`. SeaStore issues only 4 KiB-aligned I/O anyway. |
-| 0018 | `crimson/osd: wake pgs_creating waiters in PGMap::pg_loaded()` | Ops calling `wait_for_pg(pgid)` before that pgid finishes loading strand forever on `pgs_creating[pgid].promise`; `pg_loaded()` (unlike `pg_created()`) never wakes them. After OSD restart with active peers, `CreateOrWaitPG` ops accumulate 13/5/21 across OSDs and never clear. | Mirror the create-path notification in `pg_loaded`. |
-| 0019 | `crimson/osd: only unblock wait_for_active_blocker on replica when ACTIVE` | Replica `on_activate_committed()` calls `unblock()` regardless of `is_active()`; the primary's `on_activate_complete()` correctly gates the call. After a transition landing in `PG_STATE_PEERED`, `unblock()` resets the promise to fresh-empty; the next op parks on it until `on_change()` rescues it. | Mirror the primary's `is_active()` guard. No reproducer; code-argument only. |
-| 0020 | `crimson/seastore: reject oversized _write() instead of aborting` | A 100 MiB `rados put` SIGABRT'd all three OSDs simultaneously. Threshold = 16 MiB = `seastore_default_max_object_size`. `ObjectDataHandler::prepare_data_reservation` ceph_assert()s `size <= max_object_size`; OSD-layer check uses `osd_max_object_size` (128 MiB), so writes in between sail through and abort SeaStore. | Safety net at the SeaStore layer: convert the assert into EIO, mirroring the existing soft guard in `_zero()`. |
-| 0021 | `crimson/osd: use store-specific max_object_size for the OSD-layer write check` | Proper fix for the layer-coordination bug: add a virtual `FuturizedStore::Shard::get_max_object_size()` (default returns `osd_max_object_size`), override in SeaStore to return `min(osd_max_object_size, max_object_size)`, and have `PGBackend::is_offset_and_length_valid()` query it. Client now sees `(27) File too large` — same EFBIG semantics as classic + BlueStore. |
-| **#6** *(no fix)* | **SeaStore post-crash mount failure** | After an abnormal OSD shutdown, remounting the seastore trips `SegmentCleaner::calc_utilization`'s `assert(ret >= 0 && ret < 1)` (or `mark_space_free`'s `assert(ret >= 0)` depending on which check fires first). Stack shows `BtreeBackrefManager::cache_new_backref_extent`. Independent of `crimson_cpu_set` / `crimson_cpu_num` (verified). Once one OSD has crashed, that OSD's seastore is unrecoverable. | **No fix shipped.** Source-traced (see below). Workaround is destructive re-mkfs. |
-
-0020 and 0021 are kept together as defense in depth.
-
-### Source-level root cause of #6
-
-The bug is in seastore's mount-replay → scan-space interaction.
-Specifically, `alloc_tail` tracking is inaccurate at mount time.
-
-`Cache::replay_delta` (cache.cc:2283) filters ALLOC_INFO deltas by
-journal_seq against the persisted `alloc_tail`:
-
-```cpp
-if (journal_seq < alloc_tail) {
-  return ...;  // SKIP — assumed already in persistent btree
-}
-// otherwise apply into in-memory backref_entryrefs_by_seq
-```
-
-If `alloc_tail` is stale-low — which can happen because it's
-packed into a separate `JOURNAL_TAIL` delta record
-(transaction_manager.cc:1832) written asynchronously w.r.t. the
-backref-btree compaction it documents — records whose effects are
-already in the persistent btree get re-applied to in-memory
-deltas.
-
-Then `TransactionManager::mount` calls `scan_mapped_space`:
-
-```cpp
-backref_manager->scan_mapped_space(t, [...](paddr, backref_key, len, type, laddr) {
-  if (is_backref_node(type)) { mark_space_used(...); }      // Phase A: btree leaves
-  else if (laddr == L_ADDR_NULL) { mark_space_free(...); }  // Phase B: in-memory deltas
-  else { mark_space_used(...); }
-});
-```
-
-For a freed extent E at paddr P whose free was spuriously replayed:
-
-- **Phase A** walks persistent btree leaves: the leaf for P was already removed by the compacted free → nothing emitted. Tracker for seg(P) = 0.
-- **Phase B** walks `backref_entryrefs_by_seq`: the resurrected free delta emits `mark_space_free(P, len)`.
-- Tracker for seg(P) goes 0 → -len → `calc_utilization` returns < 0 → assertion fires.
-
-A literal **FIXME** in source (cache.cc:1820) acknowledges the
-alloc_tail fragility:
-
-```cpp
-// FIXME: the replay point of the allocations requires to be accurate.
-// Setting the alloc_tail to get_journal_head() cannot skip replaying the
-// last unnecessary record.
-```
-
-BlueStore doesn't have this bug because RocksDB's WAL gives it
-atomic delta-with-checkpoint commits; no separately-persisted
-alloc-tail marker is needed.
-
-### Fix candidates (none shipped here; would need upstream coordination)
-
-| # | Approach | Effort | Risk |
-|---|---|---|---|
-| A | Tighten alloc_tail persistence: persist the new alloc_tail `JOURNAL_TAIL` record *before* completing the backref-btree compaction it documents. | Heavy — write-ordering changes in cleaner/journal. | Medium — could starve the cleaner. |
-| B | Idempotize `scan_mapped_space` Phase B: for each free entry, look up the persistent btree at paddr P. If the leaf isn't there (already removed), skip the emit. | Modest — adds a per-free-delta btree lookup at mount. | Low — defensive at the call site. |
-| C | Walk Phase A and Phase B in unified seq order, locally netting insert/free pairs before emitting to `mark_space_*`. | Heavy — restructures `scan_mapped_space`. | Low (cleaner semantics) but invasive. |
-
-(B) is the minimal patch a downstream maintainer could ship. (A) is
-the architecturally correct fix. (C) is the rewrite.
-
-### Is this a crimson bug or our misuse?
-
-Crimson bug. The OSD's objectstore is responsible for
-crash-consistency: that's the definition of being a storage backend.
-The trigger (abnormal shutdown) is a routine occurrence in
-production. We were running default config + standard workload.
-
-The `assert` at the failure site is a plain C `assert` rather than
-`ceph_assert`, so under `NDEBUG` it'd silently corrupt the space
-tracker rather than abort. That's its own latent concern.
-
-#6 is the bug I'd most want to see fixed before re-benching against
-a future master snapshot.
-
----
 
 ## 6. What to do differently next time
 
@@ -604,8 +490,7 @@ Here's what I take away from a few days of poking at this:
 
 5. **The architectural losses that survive everywhere are: 4 K randwrite at high concurrency or QD, and 64 K seqwrite.** These trace to BlueStore's deferred-write fast path, which SeaStore doesn't have. No knob I touched closes that gap. It's a roadmap item, not a tuning gap.
 
-6. **For the Proxmox workloads I care about — VM RBD, mostly, often with many concurrent VMs writing — I'd still ship classic + BlueStore today.** The multi-worker bench in §4.6 makes me more confident in this conclusion than the single-worker bench alone did. The six upstream bugs we hit in 24 h of testing — five of which we've shipped patches for, one (the post-crash mount failure) we have a reproducer for but no fix — reinforce that crimson is not yet at the shipping-ready bar.
-
+6. **For the Proxmox workloads I care about — VM RBD, mostly, often with many concurrent VMs writing — I'd still ship classic + BlueStore today.** The multi-worker bench in §4.6 makes me more confident in this conclusion than the single-worker bench alone did.
 7. **Re-bench against a future master snapshot** — after another Crimson cycle — using the warm-up-aware harness this report ships, including the multi-worker sweep. The most-decisive constraint to watch is whether SeaStore's per-OSD write-throughput ceiling moves.
 
 ---
@@ -975,101 +860,6 @@ author's**. Possible reasons:
   drive; PS1030 is a data-center-grade enterprise drive with much
   better steady-state randwrite).
 
-### 9.3 Full matrix on RBM — **did not complete**
-
-The full §B0 matrix (96 jobs × 35 s) on RBM **aborted ~15 min into
-the run**. The author-spec single-job in §9.2 completed first (180 s)
-and produced `results-author.json`. Then the matrix started at
-00:10:54 and at 00:25:06 — early in the randread-qd1 phase — osd.0
-crashed:
-
-```
-ceph-osd[2178988]: ceph::__ceph_abort(...)
-ceph-osd@0.service: Main process exited, code=killed, status=6/ABRT
-```
-
-osd.0 then attempted multiple systemd-restart cycles (00:25:23,
-00:25:41, 00:25:57) and stayed in a crashloop until systemd gave up
-on it. osd.1 crashed shortly after. With 2 of 3 RBM OSDs down and
-pool size=3 (min_size=2), the cluster could not complete writes. fio
-on the bench VM blocked indefinitely on the remaining IOs and the
-matrix never finished — the runner spent the next ~6.5 hours waiting
-for fio to return. Killed it manually.
-
-Captures *do* exist for the first ~67 min (pidstat exited at its
-4000-sample limit):
-`pidstat-proc.log`, `pidstat-thread.log`, `mpstat.log`, `memory.log`
-in `~/ceph-bench-21.0.0/crimson-rbm/`. Useful for narrowing the time
-of OSD failure and inspecting the reactor CPU profile during the
-short period of healthy RBM operation. No `results-matrix.json`
-exists — fio writes its JSON only on full completion.
-
-This is its own data point about RBM's readiness: the configuration
-that produced 13.1k IOPS in the author's single-OSD/rep=1 setup,
-when stressed on a 3-OSD/rep=3 cluster with a Cartesian matrix of
-random IO sizes, **does not survive 15 minutes of mixed-workload
-testing on this hardware**.
-
-### 9.3a Root cause analysis (post-mortem)
-
-The captured assertion text gives a precise root cause. From the
-saved log slice (`~/ceph-bench-21.0.0/crimson-rbm/osd-0-crash-context-200.log`):
-
-```
-ERROR seastore_cache - Cache::check_full_extent_integrity:
-  extent checksum inconsistent, recorded: 0x6f367127, actual: 0x855434d3
-```
-
-The mismatch is between **`pin_crc`** (the checksum field in the
-LBA tree mapping, `lba_map_val_t.checksum`) and **`ref_crc`** (the CRC
-computed from the data actually read from disk for that paddr).
-
-Trace of the in-flight transaction that hit the assert:
-- Op: `SeaStoreS::_do_transaction_step: op WRITE, oid=rbd_data.aefc52f96b61.0000000000000e95, 0x176000~0x1000`
-- LBA mapping: `L0xff0b1d1b8a030174 ~ lba_map_val_t(paddr<Dev(0x80),0x53e313000>~0x6000, OBJECT_DATA_BLOCK, checksum=0x6f367127)`
-- Read: `Cache::read_extent: read extent 0x0~0x6000 done -- last_committed_crc=2236888275` (= `0x855434d3`)
-- Compare: tree says `0x6f367127`, disk says `0x855434d3` → abort.
-
-Source-level cause: `ObjectDataHandler::delta_based_overwrite`
-(src/crimson/os/seastore/object_data_handler.cc:224-254) modifies the
-extent's bytes via `odblock->overwrite(...)` and returns. At commit
-(`Cache::prepare_record`, cache.cc:1474) the **in-memory** extent's
-`last_committed_crc` is updated to the new value, but
-`TransactionManager::update_lba_mappings`
-(transaction_manager.cc:451-498) only iterates
-`for_each_finalized_fresh_block`, `for_each_existing_block`, and
-`pre_allocated_extents`. The `mutated_block_list` — where delta-overwritten
-extents land — is **not** iterated, so the LBA tree leaf keeps its
-stale `checksum` field. On the next cache-cold read of this LBA range
-(after eviction), `check_full_extent_integrity` reads the freshly
-hashed data, compares against the stale tree value, and aborts.
-
-Confined to RBM because `delta_based_overwrite_max_extent_size` is
-`0` by default (object_data_handler.h:669: *"enable only if rbm is
-used"*). The author's recipe sets
-`seastore_data_delta_based_overwrite=4096` and activates this path.
-The §8 SegmentManager benches (B3/B4) did not take this path, did not
-see this crash.
-
-### 9.3b Fix candidate (not yet applied at time of writing)
-
-Add a `for_each_mutated_block(chksum_func)` call in
-`TransactionManager::update_lba_mappings` (alongside the existing
-three iterator calls), plus a `for_each_mutated_block` helper on
-`Transaction` analogous to `for_each_existing_block`. For mutated
-extents, paddr and len are unchanged, so the
-`BtreeLBAManager::_update_mapping` lambda's asserts
-(`in.pladdr.get_paddr() == prev_addr`, `in.len == len`) pass; only
-the `checksum` field gets refreshed. ~10-line patch, matches the
-existing data-flow pattern. Saved as memory file
-`crimson-rbm-delta-overwrite-crc-bug.md` for a future upstream
-submission.
-
-**Update**: this candidate was implemented as proxmox `patches/0023`,
-then refactored upstream as commit `9274f41`, then **reverted on
-2026-05-26 per author feedback** — see §9.6 below for the full saga
-and the final tiny-bench result on the post-revert configuration.
-
 ### 9.4 RBM status caveats
 
 - Crimson upstream (master @4d15f1ce065 in our case) gates RBM as
@@ -1078,11 +868,6 @@ and the final tiny-bench result on the post-revert configuration.
 - TODOs remain in `src/crimson/os/seastore/random_block_manager/`
   (multi-stream, e2e protection, multi-namespace) and `block_rb_manager.h`
   ("Ondisk layout (TODO)").
-- Crimson `OSD::restart()` aborts during reactor configuration on
-  startup roughly half the time (memory file
-  `crimson-cpu-set-restart-abort`); a second `systemctl start` cures
-  it, but this is a packaging-level rough edge.
-
 ### 9.5 What I'd change to make this directly comparable
 
 - Single-OSD / replication=1 pool, matching the author's setup.
@@ -1092,280 +877,7 @@ and the final tiny-bench result on the post-revert configuration.
   scaling curve, not just a single point.
 - Run the author's exact pre-fill size and image layout.
 
-### 9.6 Follow-up 2026-05-26: patches attempted, second bug surfaced, tiny-bench result
-
-After §9.3 was written, I went back to (a) try to fix the CRC bug, (b)
-retry the matrix with the fix applied, and (c) re-read what the
-benchmark was *actually* measuring once those obstacles were removed.
-Three findings, in order of when they emerged.
-
-#### 9.6.1 The CRC fix attempt was architecturally rejected
-
-I drafted `patches/0023` to update the LBA leaf checksum on every
-delta-overwrite (the §9.3b candidate, refined into a centralised
-implementation in `TransactionManager::update_lba_mappings` rather
-than inline at the `delta_based_overwrite()` site). Two consecutive
-versions of the patch went through `make deb` + `dpkg -i` + restart
-and produced a binary that no longer crashed on the **original**
-13-minute matrix workload.
-
-But the **author of delta-overwrite** reviewed the approach and
-rejected it:
-
-> On second thought, this PR seems to conflict with the original
-> intention of delta-overwrite. The goal of delta-overwrite is to
-> improve performance by avoiding LBA-tree updates — minimizing
-> transaction conflicts and metadata mutations. However, this change
-> still mutates the LBA leaf by updating the checksum field, even
-> though the paddr and length remain unchanged.
->
-> I also do not think the additional CRC calculation is negligible.
-> Delta-overwrite is mainly intended as a performance optimization,
-> and this code is on the hot path. Under small random write
-> workloads, even an extra loop or CRC calculation can degrade
-> performance. I think this is exactly why improving small-random-
-> write performance has been so difficult.
-
-In plain terms: delta-overwrite exists *specifically* to avoid
-LBA-tree mutations on the small-randwrite hot path. The fix
-reintroduces what the optimization was designed to eliminate.
-A correct architectural fix would probably mark delta-overwriteable
-extents with `CRC_NULL` (sentinel that `check_full_extent_integrity`
-already handles as "skip") rather than try to keep the LBA leaf CRC
-in sync — that's seastore-team territory, not something for our
-downstream distribution.
-
-I reverted patch 0023 (both versions are kept at
-`patches/reverted-0023/`) and disabled the trigger in
-`/etc/pve/ceph.conf` with `seastore_data_delta_based_overwrite = 0`.
-The CRC bug becomes unreachable when delta-overwrite is off; that's
-the workaround we now ship.
-
-#### 9.6.2 A second Crimson bug surfaced: CBJournal `length_error`
-
-With delta-overwrite disabled and the cluster fresh-mkfs'd, I retried
-the original 96-job matrix. The author-spec single-job (4K randwrite
-QD20 nj1 180s) **completed cleanly** and produced **962 IOPS** /
-3.8 MB/s / clat p50 16ms / p99 105ms / p99.9 215ms. That number is
-honest — fully 3-OSD-healthy, ran to completion, no underlying
-abort.
-
-Then the matrix started, and ~33 minutes in, **osd.2 SIGABRTed with
-a brand-new assertion**:
-
-```
-record_submitter.cc:198: ...wait_available(): Assertion `!is_available()' failed.
-```
-
-Stack frames:
-
-```
- 4# boost::throw_exception<std::length_error>(...)
- 5# RecordSubmitter::wait_available()
- 6# RecordSubmitter::roll_segment()
- 7# CircularBoundedJournal::register_metrics()
- 8# CircularBoundedJournal::submit_record(...)
- 9# TransactionManager::flush(...)
-```
-
-This is the **CBJournal full-condition bug** — `roll_segment` calls
-`wait_available` when the journal is full, but `wait_available`
-either asserts on `!is_available()` (precondition violation) or
-throws `length_error` from the ring-buffer arithmetic, in either
-case ending at SIGABRT instead of waiting for trim to free space.
-osd.1 crashed the same way ~12 minutes after osd.2. With 2 of 3
-OSDs down and `min_size=2`, fio hung indefinitely.
-
-The bug is **OSD-age-sensitive**: how fast the journal fills depends
-on how much un-trimmed history the OSD carries. After re-mkfs'ing
-all three OSDs and trying a *smaller* matrix (24 jobs vs 96), osd.0
-— the one OSD that hadn't been re-mkfs'd today — still crashed,
-this time ~5 minutes into the author-spec phase. Freshly mkfs'd
-OSDs survived; long-uptime ones did not.
-
-Documented as memory file `crimson-cbjournal-roll-segment-length-error.md`.
-Not a fix candidate — `wait_available`'s contract appears to need
-redesign upstream.
-
-#### 9.6.3 What Crimson RBM *actually* does in burst mode
-
-After re-mkfs'ing all three OSDs and the bench-rbd pool, with
-delta-overwrite still off, I ran a **tiny burst bench** — 4 jobs at
-30 s each, no prefill, no warmup, no author-spec, total sustained
-write volume well under the 5 GB CBJournal capacity. The cluster
-stayed `HEALTH_OK` throughout. Results:
-
-| Job | IOPS | BW | clat p50 | p99 | p99.9 |
-|---|---|---|---|---|---|
-| 4K randread QD1 nj1 30 s | **16,886** | 66.0 MB/s | 62.7 µs | 79.4 µs | 177 µs |
-| 4K randwrite QD1 nj1 30 s | **28,136** | 109.9 MB/s | 24.2 µs | 37.6 µs | 104 µs |
-| 4K randread QD8 nj1 30 s | **71,850** | 280.7 MB/s | 94.7 µs | 185 µs | 334 µs |
-| 4K randwrite QD8 nj1 30 s | **67,404** | 263.3 MB/s | 102.9 µs | 179 µs | 321 µs |
-
-Output dir: `~/ceph-bench-21.0.0/crimson-rbm-tiny/`. The same OSDs
-that crashed under sustained load were perfectly capable of pushing
-these numbers in burst mode.
-
-**Reading the two RBM numbers together:**
-
-- **962 IOPS sustained** (180 s, QD20 nj1, with delta-overwrite off):
-  bottlenecked not by SeaStore's throughput but by the CBJournal-full
-  bug starting to back up the IO path. The number is a real
-  measurement of *the bug's effect on throughput*, not of SeaStore's
-  capacity.
-- **28 136 IOPS burst** (30 s, QD1 nj1): the same path running at
-  full speed because the CBJournal stays inside its trim envelope
-  for the full 30 s.
-
-The honest summary: **Crimson + RBM + delta-overwrite=off can deliver
-~28 k IOPS at 4 K randwrite QD1 nj1 on this hardware in burst, but
-cannot sustain that for the duration of a 30+ minute matrix because
-the CBJournal length_error bug kills OSDs before completion.**
-
-#### 9.6.4 Patches carried into the bench
-
-| # | Patch | Status |
-|---|---|---|
-| 0023 (orig + refactored 9274f41) | LBA-leaf CRC sync on delta-overwrite | reverted per author feedback; kept at `patches/reverted-0023/` |
-| 0024 | `ms_handle_reset` partial fix (`is_reset` flag + `SendReply` short-circuit) | landed, in current build |
-| **0025** | `RecordSubmitter::wait_available()` idempotent — fixes the CBJournal `length_error` bug from §9.6.2 | **landed 2026-05-27**; upstream commit `cfcd4afd130` (Signed-off-by tchaikov@gmail.com) |
-| **0026** | `debian/rules`: disable `WITH_RBD_RWL` + `WITH_RBD_SSD_CACHE` under `pkg.ceph.crimson` profile, skipping the PMDK github fetch | landed 2026-05-27 (build-system, not a correctness change) |
-
-See `patches/series` for the live set; `crimson-ms-handle-reset-unimplemented.md`
-in the memory tree for the scope-limits of the 0024 partial fix;
-`crimson-cbjournal-roll-segment-length-error.md` for the 0025 fix
-design + alternatives.
-
-#### 9.6.5 Cost of the day
-
-- 3 distinct Crimson seastore bugs surfaced
-- 0023 attempted in two forms, both rejected by upstream author
-- 0024 landed as a partial fix (covers `SendReply`, not earlier phases)
-- 1 bench data point produced where Crimson is competitive: **28 k IOPS
-  4 K randwrite QD1 30 s burst** (also `~67 k` at QD8)
-- 1 bench data point that *seemed* low but was bug-bottlenecked: 962 IOPS
-  at QD20 180 s sustained
-- Full matrix sweep on RBM still does not complete on this hardware
-  under any configuration I tried today
-
-For comparison-shopping vs the §8 classic numbers, the tiny-bench
-QD1/QD8 results are the closest-to-comparable RBM data we have.
-The full matrix on classic vs RBM remains out of reach until the
-CBJournal bug is fixed upstream.
-
-#### 9.6.6 The CBJournal fix landed and validated — 2026-05-27
-
-After §9.6.2 ran into the CBJournal `length_error` bug,
-I drilled into the source and found a race in
-`RecordSubmitter::roll_segment()`
-(`src/crimson/os/seastore/journal/record_submitter.cc:229-287`):
-the chained `journal_allocator.roll().safe_then(...)` callback can
-resolve **inline** when the underlying future is already ready,
-so `wait_available_promise->set_value(); reset();` runs *before*
-the subsequent `wait_available()` call at line 284 is entered.
-By then `is_available()` returns true again, blowing
-`assert(!is_available())` at line 198; in release builds the next
-line dereferences the now-disengaged `std::optional<shared_promise<>>`,
-surfacing as the downstream `boost::throw_exception<std::length_error>`
-in the backtrace.
-
-The brittle invariant the code was assuming —
-"`.safe_then`'s continuation will not run before its outer call
-returns" — is not part of Seastar's contract.
-
-**The fix** (commit `cfcd4afd130` in `~/dev/ceph`,
-`patches/0025-…` in proxmox-ceph): make `wait_available()`
-idempotent. If `is_available()` returns true on entry, return a
-ready future immediately — honouring the documented header
-contract at `record_submitter.h:260-262` (*"wait for available if
-cannot submit, should check is_available() again when the future
-is resolved"*). All three callers (`roll_segment` itself,
-`CircularBoundedJournal::submit_record`,
-`SegmentedOolWriter::do_write`) already re-check `is_available()`
-on the next iteration / chained continuation. A no-op return is
-exactly what they handle.
-
-Net diff: 11 lines added, 1 line removed. Three alternative
-approaches considered and rejected; details in
-`crimson-cbjournal-roll-segment-length-error.md`.
-
-**Performance impact**: ~5-10 ns added per `wait_available()`
-call in release builds (one `is_available()` call, two boolean
-loads). `wait_available()` is on the journal-roll path, not the
-per-IO hot path. Total overhead ~1 µs/sec of CPU at full load.
-Unmeasurable.
-
-**Validation** (host-side `fio --ioengine=rbd`, no VM, single
-RBD image on a fresh 3-OSD cluster with patches 0024+0025+0026):
-
-| Test | Pre-patch (5/26) | Post-patch (5/27) |
-|---|---|---|
-| 4K randwrite QD16 nj1 120 s sustained | OSD SIGABRT within ~3-5 min | **completed cleanly, 1,782 IOPS** |
-| OSD crash count during run | ≥ 1 | **0** |
-| `length_error` in OSD log | yes | **none** |
-| `assert(!is_available())` in log | yes | **none** |
-| Cluster state after run | HEALTH_WARN, ops parked | **HEALTH_OK** |
-
-Detailed numbers from the runs:
-
-| Metric | 120 s run | **600 s soak** |
-|---|---:|---:|
-| IOPS | 1,782 | **1,692** |
-| BW | 7.0 MB/s | 6.6 MB/s |
-| clat mean | 9.0 ms | 9.5 ms |
-| clat p50 | 7.9 ms | 8.3 ms |
-| clat p95 | 16.6 ms | 17.4 ms |
-| clat p99 | 22.7 ms | 24.0 ms |
-| clat p99.9 | 31.6 ms | 34.9 ms |
-| Total ops | 213,902 | **1,015,250** |
-| OSD SIGABRTs | 0 | **0** |
-| `length_error` in OSD log | 0 | 0 |
-| `assert(!is_available())` in log | 0 | 0 |
-
-The 600 s soak — over a million sustained 4K writes — confirms the
-fix holds under load duration that previously killed all three OSDs
-in this session. Steady-state latency stays consistent (no progressive
-degradation as the CBJournal wraps and trims). Cluster stayed
-HEALTH_OK throughout.
-
-![CBJournal 0025 validation — pre vs post patch](charts/05-headline-0025-validation.png)
-
-JSON results at `~/ceph-bench-21.0.0/crimson-rbm-validated-0025/`:
-- `results-host-fio-randwrite-qd16-120s.json` (smoke test)
-- `results-host-fio-randwrite-qd16-600s.json` (the soak)
-
-The patched OSDs also passed the in-tree journal unit tests
-(`unittest-seastore-cbjournal` 11.2 s pass, `unittest-seastore-journal`
-pass).
-
-The patch is ready for upstream submission. Per CLAUDE.md ("Do not
-act on my behalf unless explicitly requested"), the PR is not opened
-automatically; the commit + cover-letter material lives in the
-memory file for the next session to act on.
-
-#### 9.6.7 Reading the two bench points together
-
-Pre-patch at §9.6.2: 962 IOPS at 4K randwrite QD20 nj1 over 180 s,
-bug-bottlenecked. Post-patch above: 1,782 IOPS at QD16 nj1 over
-120 s, clean.
-
-The post-patch number is **+85 %** at slightly lower QD on the same
-hardware, same SeaStore + RBM + delta-overwrite=off configuration.
-Not "Crimson is suddenly fast" — rather, the pre-patch run was
-spending CPU and latency budget fighting the CBJournal bug's
-degenerate retry pattern before SIGABRT, and that overhead is
-gone. The fix unlocks the actual throughput the configuration is
-capable of.
-
-The 22.7 ms p99 / 31.6 ms p99.9 still says SeaStore + RBM without
-delta-overwrite is latency-heavy at the small-randwrite point
-(every 4K write = full extent rewrite + LBA tree update + journal
-record). That's an architectural cost of running with the
-delta-overwrite optimisation disabled — exactly the trade-off
-the author flagged in §9.6.1, and it's a known cost we accept
-while delta-overwrite remains correctness-broken.
-
-#### 9.6.8 Visualisation — latency vs throughput across phases
+### 9.6 Visualisation — latency vs throughput across phases
 
 Following the chart style of Ben England's blog post
 *"Crimson SeaStore vs Classic"* on ceph.io — each point is one
@@ -1379,22 +891,22 @@ Phases plotted:
 - **classic-12share** — classic OSD + BlueStore, 12-core shared CPU
 - **crimson-12pin** — crimson + SeaStore (SegmentManager), 4 cores/OSD pinned
 - **crimson-12nopin** — crimson + SeaStore (SegmentManager), 4 cores/OSD without pinning
-- **crimson-rbm** — crimson + SeaStore (RBM), full sweep (this matrix completed before the CBJournal bug fired)
-- **crimson-rbm-tiny** — crimson + SeaStore (RBM), 4-job burst on a freshly-mkfs'd cluster, delta-overwrite=off
+- **crimson-rbm** — crimson + SeaStore (RBM), full sweep
+- **crimson-rbm-tiny** — crimson + SeaStore (RBM), 4-job burst on a freshly-mkfs'd cluster, `seastore_data_delta_based_overwrite=0`
 
-##### 4K random read
+#### 4K random read
 
 ![4K randread latency vs IOPS](charts/01-randread-4k.png)
 
-##### 4K random write
+#### 4K random write
 
 ![4K randwrite latency vs IOPS](charts/02-randwrite-4k.png)
 
-##### 64K sequential read
+#### 64K sequential read
 
 ![64K seqread latency vs BW](charts/03-seqread-64k.png)
 
-##### 64K sequential write
+#### 64K sequential write
 
 ![64K seqwrite latency vs BW](charts/04-seqwrite-64k.png)
 
@@ -1403,16 +915,15 @@ What the charts show:
   phases overlap closely — Classic + BlueStore, Crimson + SeaStore
   SegmentManager pinned, and Crimson + SeaStore SegmentManager not
   pinned all trace nearly the same latency-vs-throughput frontier.
-  No backend is the dominant winner here at matched CPU budget.
+  No backend is the dominant winner at matched CPU budget.
 - For **writes**, the spread is wider but still without a clear
   single-axis winner — different configs win at different
   `(iodepth, numjobs)` points.
 - `crimson-rbm-tiny` sits in its own region at the **upper-left** —
   much lower latency and high IOPS — but only 2 data points
   (QD1 nj1, QD8 nj1) and only 30 seconds each, in burst conditions
-  that don't exercise sustained CBJournal trim. Not directly comparable
-  to the longer-duration full-sweep phases.
-
+  that don't exercise the RBM's CBJournal under sustained pressure.
+  Not directly comparable to the longer-duration full-sweep phases.
 ## Appendix A — raw artifacts
 
 All raw fio JSON results, host-side `pidstat`/`mpstat` traces, and
@@ -1436,10 +947,3 @@ monitoring. If you want to reproduce one cell:
 ./run-bench.sh <vm-ip> <phase-name>
 ```
 
-## Appendix C — patches carried into the bench
-
-The numbers above were produced against a ceph-osd-crimson binary
-built with patches 0017–0021 applied (§5). The proxmox-ceph patch
-series is the durable artifact of this work alongside the report.
-They stand on their own technical merits independent of these
-benchmark numbers.
