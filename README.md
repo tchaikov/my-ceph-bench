@@ -142,15 +142,9 @@ and the phase was restarted.
 
 ## 3. Results — matched 12-core CPU budget
 
-A reviewer pointed out that the §3–§7 comparison wasn't fair: classic
-ran with the NVMe default thread pool (≈48 worker threads across 3
-OSDs on a 32-core host) while crimson ran with at most 12 reactors.
-Pinning vs no-pinning was confounded with reactor-count vs default
-config.
-
-This section redoes the comparison with **the same 12-core CPU budget
-on both sides**, holds reactor count constant for the crimson runs,
-and isolates the pinning-vs-no-pinning variable.
+Same 12-core CPU budget on both sides. Reactor count held constant
+for the two crimson runs so that pinning vs no-pinning is isolated
+as the only variable that differs between them.
 
 ### 3.1 Setup
 
