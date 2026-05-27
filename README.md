@@ -388,6 +388,18 @@ latency. At the QD32 nj64 corner, classic-12share writes p99 at
 
 ### 3.6 Per-core CPU use
 
+**Reactor mode**: `crimson_poll_mode` was **not** set in `ceph.conf`
+for any of the three phases, and pidstat-proc confirms event-driven
+behaviour: per-OSD `%CPU` drops to ~2 % during inter-job gaps and
+ramps to ~395 % at peak. Poll-mode would have pinned reactors at
+~400 % continuously regardless of load. So the numbers below reflect
+work actually done, not a poll-loop floor.
+
+| Phase | per-OSD %CPU min | max | mean |
+|---|---:|---:|---:|
+| classic-12share | 3 % | 294 % | 85 % |
+| crimson-12pin   | 2 % | 395 % | 212 % |
+
 mpstat samples (1 s, full bench duration):
 
 - **classic-12share**: cores 0-11 saturate at ~70-95 % under peak
