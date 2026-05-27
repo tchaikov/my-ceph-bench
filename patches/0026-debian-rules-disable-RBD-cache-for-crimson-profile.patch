@@ -1,0 +1,40 @@
+From: Kefu Chai <k.chai@proxmox.com>
+Date: Tue, 26 May 2026 23:30:00 +0800
+Subject: [PATCH] debian/rules: disable RBD persistent caches for the crimson
+ build profile
+
+The crimson build profile does not exercise librbd's persistent
+write-log cache (WITH_RBD_RWL) or SSD cache (WITH_RBD_SSD_CACHE).
+Both options pull in PMDK via Buildpmdk.cmake's network-dependent
+ExternalProject_Add (GIT_REPOSITORY https://github.com/ceph/pmdk.git),
+which is a frequent build-time failure point.
+
+Disable both when building the crimson profile. cmake honours
+last-wins for repeated -D options on the command line, so appending
+=OFF after the earlier =ON cleanly overrides without needing to
+delete the existing lines (non-crimson builds keep them unchanged).
+
+Signed-off-by: Kefu Chai <k.chai@proxmox.com>
+---
+ debian/rules | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/debian/rules b/debian/rules
+--- a/debian/rules
++++ b/debian/rules
+@@ -36,6 +36,15 @@ else
+   extraopts += -DWITH_RBD_RWL=OFF
+ endif
+ extraopts += -DWITH_RBD_SSD_CACHE=ON
++
++# Crimson does not use BlueStore persistent-memory features or
++# librbd's persistent caches; force them off when building the
++# crimson profile to skip Buildpmdk.cmake's network-dependent
++# GIT_REPOSITORY fetch of github.com/ceph/pmdk.git.
++ifneq ($(filter pkg.ceph.crimson,$(DEB_BUILD_PROFILES)),)
++  extraopts += -DWITH_RBD_RWL=OFF
++  extraopts += -DWITH_RBD_SSD_CACHE=OFF
++endif
+ # assumes that ceph is exmpt from multiarch support, so we override the libdir.
+ extraopts += -DCMAKE_INSTALL_LIBDIR=/usr/lib
+ extraopts += -DCMAKE_INSTALL_LIBEXECDIR=/usr/libexec

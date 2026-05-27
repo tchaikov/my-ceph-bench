@@ -1,0 +1,177 @@
+From ac839be6bd11c7dba92d2b66efca36950251f969 Mon Sep 17 00:00:00 2001
+From: Kefu Chai <k.chai@proxmox.com>
+Date: Tue, 26 May 2026 15:45:36 +0800
+Subject: [PATCH] crimson/osd: mark conn priv on ms_handle_reset; short-circuit
+ reply send
+
+OSD::ms_handle_reset and OSD::ms_handle_remote_reset were TODO stubs
+that only logged a warning.  When a client connection dropped (network
+reset, SIGTERM'd librbd admin command, killed VM, etc.), no per-conn
+cleanup ran.  In-flight ClientRequests that had already progressed past
+the connection pipeline could still attempt to issue their reply on a
+peer that was gone, and -- more importantly -- nothing on the OSD side
+signalled "this peer is dead" to short-circuit futile work.  Slow ops
+on the affected OBCs accumulated indefinitely.
+
+Add a `std::atomic<bool> is_reset` to OSDConnectionPriv, set by the
+reset handlers on the connection's home shard, readable from any shard
+via the new helper `is_conn_reset(Connection&)` for cross-stage short-
+circuit checks.  Use it at both `send_with_throttling` sites in
+ClientRequest::process_op: if the conn is reset by the time we reach
+the SendReply stage, drop the reply and `co_return`.  The op exits its
+SendReply phase cleanly via ExitBarrier, releasing the OBC pipeline
+mutex; queued ops on the same OBC can proceed.
+
+Deliberately scoped:
+
+ - Does NOT detach the user_private (`set_user_private(nullptr)`).
+   The ConnectionPipelines inside it may still have parked ops with
+   live PipelineHandles; tearing the priv down would dangle them.
+   Lifetime stays tied to the Connection ref; the flag is the
+   cancellation signal.
+
+ - Does NOT cancel ops in earlier phases (AwaitActive, AwaitMap,
+   GetPGMapping, get_obc, wait_repop).  Each of those is a separate
+   wait point with its own ordering invariants, best handled in
+   follow-up patches if needed.
+
+ - Does NOT mirror classic OSD's full Session-teardown semantics
+   (cancel watch/lock state, break refcycles).  Crimson does not yet
+   have an equivalent Session abstraction; that is a larger
+   architectural effort.
+
+The atomic is read with acquire ordering; the transition is monotonic
+(false -> true), so a stale cross-shard read at worst misses a freshly-
+set value, in which case the op proceeds to call send() -- which is
+fire-and-forget in Crimson's send_with_throttling and therefore
+harmless on a dead connection.  No new ordering hazard introduced.
+
+Signed-off-by: Kefu Chai <k.chai@proxmox.com>
+---
+ src/crimson/osd/osd.cc                        | 19 ++++++++++++--
+ src/crimson/osd/osd_connection_priv.h         | 26 +++++++++++++++++++
+ .../osd/osd_operations/client_request.cc      | 15 ++++++++++-
+ 3 files changed, 57 insertions(+), 3 deletions(-)
+
+diff --git a/src/crimson/osd/osd.cc b/src/crimson/osd/osd.cc
+index 77b8f85fb9c..07bf880383e 100644
+--- a/src/crimson/osd/osd.cc
++++ b/src/crimson/osd/osd.cc
+@@ -1074,15 +1074,30 @@ OSD::do_ms_dispatch(
+ 
+ void OSD::ms_handle_reset(crimson::net::ConnectionRef conn, bool is_replace)
+ {
+-  // TODO: cleanup the session attached to this connection
+   LOG_PREFIX(OSD::ms_handle_reset);
+-  WARN("{}", *conn);
++  WARN("{} is_replace={}", *conn, is_replace);
++  // Mark the conn's user_private so in-flight ops can short-circuit
++  // futile work (e.g. dropping a reply destined for a peer that has
++  // gone away).  We intentionally do NOT detach/destroy the priv here:
++  // its ConnectionPipelines may still hold parked ops whose
++  // PipelineHandles would dangle if the pipelines were destructed
++  // out from under them.  Lifetime stays tied to the Connection ref;
++  // the flag is the cancellation signal.
++  if (conn->has_user_private()) {
++    auto& priv = static_cast<OSDConnectionPriv&>(conn->get_user_private());
++    priv.is_reset.store(true, std::memory_order_release);
++  }
+ }
+ 
+ void OSD::ms_handle_remote_reset(crimson::net::ConnectionRef conn)
+ {
+   LOG_PREFIX(OSD::ms_handle_remote_reset);
+   WARN("{}", *conn);
++  // See ms_handle_reset above for the rationale; same handling.
++  if (conn->has_user_private()) {
++    auto& priv = static_cast<OSDConnectionPriv&>(conn->get_user_private());
++    priv.is_reset.store(true, std::memory_order_release);
++  }
+ }
+ 
+ void OSD::handle_authentication(const EntityName& name,
+diff --git a/src/crimson/osd/osd_connection_priv.h b/src/crimson/osd/osd_connection_priv.h
+index bb019f7a297..e3abd4a166b 100644
+--- a/src/crimson/osd/osd_connection_priv.h
++++ b/src/crimson/osd/osd_connection_priv.h
+@@ -3,6 +3,8 @@
+ 
+ #pragma once
+ 
++#include <atomic>
++
+ #include "crimson/common/smp_helpers.h"
+ #include "crimson/net/Connection.h"
+ #include "crimson/osd/osd_operation.h"
+@@ -19,6 +21,15 @@ struct OSDConnectionPriv : public crimson::net::Connection::user_private_t {
+   ConnectionPipeline peering_request_conn_pipeline;
+   ConnectionPipeline replicated_request_conn_pipeline;
+   crosscore_ordering_t crosscore_ordering;
++
++  // Set by OSD::ms_handle_reset / ms_handle_remote_reset on the conn's
++  // home shard.  Readable from any shard for short-circuit checks (e.g.
++  // a reply about to be sent on a connection whose peer has gone away).
++  // Transition is monotonic (false -> true), so a relaxed cross-shard
++  // read can at worst miss a freshly-set value and we proceed with the
++  // send -- which is fire-and-forget in Crimson's send_with_throttling
++  // and therefore harmless on a dead connection.
++  std::atomic<bool> is_reset{false};
+ };
+ 
+ static inline OSDConnectionPriv &get_osd_priv(crimson::net::Connection *conn) {
+@@ -28,4 +39,19 @@ static inline OSDConnectionPriv &get_osd_priv(crimson::net::Connection *conn) {
+   return static_cast<OSDConnectionPriv&>(conn->get_user_private());
+ }
+ 
++// Returns true if OSD::ms_handle_reset has been called for `conn`.
++//
++// Safe to call from any shard: OSDConnectionPriv lifetime is tied to the
++// Connection ref (the caller is presumed to hold one), and `is_reset` is
++// an atomic with a monotonic false->true transition.  May be called on
++// connections that never had an OSDConnectionPriv allocated (returns
++// false in that case).
++static inline bool is_conn_reset(crimson::net::Connection &conn) {
++  if (!conn.has_user_private()) {
++    return false;
++  }
++  auto &priv = static_cast<OSDConnectionPriv&>(conn.get_user_private());
++  return priv.is_reset.load(std::memory_order_acquire);
++}
++
+ }
+diff --git a/src/crimson/osd/osd_operations/client_request.cc b/src/crimson/osd/osd_operations/client_request.cc
+index f21ec89e2d8..21186038ffb 100644
+--- a/src/crimson/osd/osd_operations/client_request.cc
++++ b/src/crimson/osd/osd_operations/client_request.cc
+@@ -572,7 +572,13 @@ ClientRequest::do_process(
+       pg->peering_state.get_info().last_update,
+       pg->peering_state.get_info().last_user_version);
+     reply->add_flags(CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK);
+-    
++
++    if (is_conn_reset(get_foreign_connection())) {
++      DEBUGDPP("{}.{}: conn reset; dropping error reply",
++               *pg, *this, this_instance_id);
++      co_return;
++    }
++
+     // TODO: gate the crosscore sending
+     co_await interruptor::make_interruptible(
+       get_foreign_connection().send_with_throttling(std::move(reply)));
+@@ -609,6 +615,13 @@ ClientRequest::do_process(
+     
+     DEBUGDPP("{}.{}: sending response {}",
+ 	     *pg, *this, this_instance_id, *m);
++
++    if (is_conn_reset(get_foreign_connection())) {
++      DEBUGDPP("{}.{}: conn reset; dropping reply",
++               *pg, *this, this_instance_id);
++      co_return;
++    }
++
+     // TODO: gate the crosscore sending
+     co_await interruptor::make_interruptible(
+       get_foreign_connection().send_with_throttling(std::move(reply))
+-- 
+2.47.3
+
