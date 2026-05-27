@@ -20,7 +20,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-BENCH_ROOT = Path("/home/kefu/ceph-bench-21.0.0")
+BENCH_ROOT = Path(__file__).resolve().parent.parent  # repo root
+RESULTS_ROOT = BENCH_ROOT / "results"
 OUT_DIR = BENCH_ROOT / "charts"
 OUT_DIR.mkdir(exist_ok=True)
 
@@ -68,20 +69,19 @@ def parse_jobs(jobs):
 
 def gather_phase(phase_name, json_name="results-matrix.json"):
     """Return list of tuples (workload, qd, nj, iops, bw, clat_us, p99_us)."""
-    path = BENCH_ROOT / phase_name / json_name
+    path = RESULTS_ROOT / phase_name / json_name
     if not path.exists():
         return []
     return list(parse_jobs(load_fio_jobs(path)))
 
 
 # --- Configuration: which phases to plot, with style ---
+# Only the three matched-budget (12-core CPU total) phases.
 PHASES = [
     # (label, dir, json, color, marker, comment)
     ("classic-12share (BlueStore)",   "classic-12share",       "results-matrix.json", "#1f77b4", "o", "12-core shared CPU"),
-    ("crimson-12pin (SeaStore Seg)",  "crimson-12pin",         "results-matrix.json", "#2ca02c", "s", "4 cores/OSD pinned"),
-    ("crimson-12nopin (SeaStore Seg)","crimson-12nopin",       "results-matrix.json", "#9467bd", "^", "4 cores/OSD no pin"),
-    ("crimson-rbm (RBM)",             "crimson-rbm",           "results-matrix.json", "#d62728", "D", "before CRC-bug-revert"),
-    ("crimson-rbm-tiny (RBM post-revert)", "crimson-rbm-tiny", "results-matrix.json", "#ff7f0e", "v", "delta-overwrite=0, fresh"),
+    ("crimson-12pin (SeaStore)",      "crimson-12pin",         "results-matrix.json", "#2ca02c", "s", "4 cores/OSD pinned"),
+    ("crimson-12nopin (SeaStore)",    "crimson-12nopin",       "results-matrix.json", "#9467bd", "^", "4 cores/OSD no pin"),
 ]
 
 
