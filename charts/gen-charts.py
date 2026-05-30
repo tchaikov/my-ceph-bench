@@ -76,12 +76,11 @@ def gather_phase(phase_name, json_name="results-matrix.json"):
 
 
 # --- Configuration: which phases to plot, with style ---
-# Only the three matched-budget (12-core CPU total) phases.
+# The two matched-budget (12-core CPU total) phases.
 PHASES = [
     # (label, dir, json, color, marker, comment)
     ("classic-12share (BlueStore)",   "classic-12share",       "results-matrix.json", "#1f77b4", "o", "12-core shared CPU"),
     ("crimson-12pin (SeaStore)",      "crimson-12pin",         "results-matrix.json", "#2ca02c", "s", "4 cores/OSD pinned"),
-    ("crimson-12nopin (SeaStore)",    "crimson-12nopin",       "results-matrix.json", "#9467bd", "^", "4 cores/OSD no pin"),
 ]
 
 

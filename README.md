@@ -2,23 +2,18 @@
 
 I wanted a fair head-to-head between crimson + SeaStore and classic +
 BlueStore on Ceph master, on real hardware that mirrors what a Proxmox
-user might deploy: one host, a single NVMe, three OSDs. To make the
-comparison meaningful, both sides operate under the **same CPU budget**:
-12 cores total for 3 OSDs.
+user might deploy: one host, a single NVMe, three OSDs. Both sides run
+under the **same CPU budget**: 12 cores total for 3 OSDs.
 
 - **classic-12share** — classic OSD + BlueStore, all three OSDs share
   the same 12-core cpuset
 - **crimson-12pin** — crimson + SeaStore (SegmentManager), each OSD
   pinned to a private 4-core group (0-3, 4-7, 8-11)
-- **crimson-12nopin** — crimson + SeaStore (SegmentManager), cluster-wide
-  `crimson_cpu_num=4`, no per-OSD pinning; processes share the
-  12-core pool
 
 The same 96-job fio matrix runs against each — four workloads
 (4 K randread, 4 K randwrite, 64 K seqread, 64 K seqwrite) × six
 iodepths (1, 2, 4, 8, 16, 32) × four numjobs (1, 4, 32, 64).
-What follows is what those numbers tell me, with the underlying
-JSON in `results/` for anyone who wants to slice it differently.
+Raw JSON is in `results/`.
 
 ---
 
@@ -42,8 +37,9 @@ the device-reported alignment matches before `mkfs`.
 
 | Item | Value |
 |---|---|
-| Kernel | Linux 6.17.13-2-pve |
-| Ceph | 21.0.0-pve1 (master snapshot at `4d15f1ce065`) |
+| Kernel | Linux 7.0.2-6-pve |
+| Ceph | 21.0.0-pve1 — proxmox HEAD `fd44b48`, based on upstream `54a58396ffa7` with local fixes applied |
+| Build type | `-O2` RelWithDebInfo, **`-DNDEBUG`** (plain `assert()` compiled out; `ceph_assert` still active). The `-O3` Release build crash-loops under PG load, so `-O2` is the usable optimized build. |
 | Cluster shape | 1 mon, 1 mgr, 3 OSDs (all on the single host `pve`) |
 | Pool under test | `bench-rbd`, size=3, min_size=2, pg_num=32 |
 | CRUSH rule | `bench-rule` — `chooseleaf_firstn 0 type osd`. Switched from the default host-level rule because all three OSDs live on one host; the default rule leaves PGs permanently `undersized+peered`. |
@@ -52,9 +48,9 @@ the device-reported alignment matches before `mkfs`.
 
 | Item | Value |
 |---|---|
-| Bench VM | Proxmox VM 9001, debian-13 cloud image, 4 vCPU, 4 GiB RAM |
-| VM disks | `scsi0`: 8 GiB boot on bench-rbd. `scsi1`: 32 GiB raw test device exposed as `/dev/sdb` |
-| fio | 3.39, inside the VM, `ioengine=libaio`, `direct=1`, `time_based`, `numjobs=1`, `group_reporting=1` |
+| Bench VM | Proxmox VM 9001, debian-12 (bookworm) cloud image, 4 vCPU, 4 GiB RAM |
+| VM disks | `scsi0`: 3 GiB boot on bench-rbd. `scsi1`: 32 GiB raw test device exposed as `/dev/sdb` |
+| fio | 3.33, inside the VM, `ioengine=libaio`, `direct=1`, `time_based`, `group_reporting=1` |
 | Storage path | VM `/dev/sdb` → virtio-scsi → host qemu → librbd → 3-OSD pool (rbd object size = 4 MiB default) |
 
 ---
@@ -63,88 +59,61 @@ the device-reported alignment matches before `mkfs`.
 
 ### 2.1 The workload
 
-A single fio job file, `bench-matrix.fio`, run inside the bench VM
-against `/dev/sdb`. Four workloads × six iodepths × four numjobs =
-**96 jobs**, separated by `stonewall` so they run sequentially.
+One fio job file, `bench-matrix.fio`, holds all 96 jobs: four
+workloads × six iodepths × four numjobs, each `runtime=30 ramp_time=5`,
+`stonewall`-separated so they run one at a time.
 
 ```
-[global]
-ioengine=libaio
-direct=1
-filename=/dev/sdb
-time_based=1
-runtime=30
-ramp_time=5
-group_reporting=1
-
 # 4 K random
-[randread-qd{1,2,4,8,16,32}-nj{1,4,32,64}]   bs=4k rw=randread  iodepth=N numjobs=M stonewall
-[randwrite-qd{1,2,4,8,16,32}-nj{1,4,32,64}]  bs=4k rw=randwrite iodepth=N numjobs=M stonewall
-
+rw=randread  bs=4k   (×  qd∈{1,2,4,8,16,32} × nj∈{1,4,32,64})
+rw=randwrite bs=4k   (×  …)
 # 64 K sequential
-[read-qd{1,2,4,8,16,32}-nj{1,4,32,64}]       bs=64k rw=read     iodepth=N numjobs=M stonewall
-[write-qd{1,2,4,8,16,32}-nj{1,4,32,64}]      bs=64k rw=write    iodepth=N numjobs=M stonewall
+rw=read      bs=64k  (×  …)
+rw=write     bs=64k  (×  …)
 ```
-
-Per-job runtime: 30 s of measurement after a 5 s ramp.
-Total per-phase wall-time: 96 × 35 s ≈ 56 min.
 
 ### 2.2 Per-phase ritual
 
-For each of the three configurations:
-
-1. **Cluster preparation** — restart OSDs into the target config and
-   wait for `ceph -s` to report `HEALTH_OK` before starting fio.
-2. **Bench warmup pass** (`warmup.fio`) — 30 s of 4 K randread at
-   QD32 numjobs=4 against `/dev/sdb`, to warm OSD caches, librbd
-   connection state, and reactor scheduling hot paths.
-3. **Matrix run** — `fio --output-format=json bench-matrix.fio`
-   produces a single `results-matrix.json` containing all 96 jobs.
-4. **Host-side capture, in parallel with step 3:**
-   - `pidstat -u -r -p <osd-pids> 1`  → per-process CPU + RSS
-   - `pidstat -t -u -p <osd-pids> 1`  → per-thread CPU (catches per-reactor utilisation)
-   - `mpstat -P ALL 1`                → per-core utilisation across all 32 cores
-   - loop sampling `/proc/<osd-pid>/status` + `ceph daemon osd.N dump_mempools` every 60 s → memory + mempool snapshots
-
-Every phase's artifacts live in `results/<phase>/`. JSONs are in this
-repo; full pidstat/mpstat traces are kept on the test host.
+1. (re)create the OSDs for the phase's backend + CPU layout.
+2. recreate the `bench-rbd` pool fresh.
+3. prefill the 32 GiB test device with a 24 GiB sequential write
+   (so randwrite hits allocated space, not first-touch).
+4. warmup pass.
+5. author-spec single point: 4 K randwrite, QD20, numjobs=1, 180 s.
+6. the 96-job matrix.
+7. collectors run throughout: `pidstat -u -r -p` (per-process),
+   `pidstat -t` (per-thread → per-reactor CPU%), `mpstat -P ALL`
+   (per-core), plus `/proc/PID/status` `VmPeak/HWM/RSS` every 60 s.
 
 ### 2.3 Methodological limitations
 
-1. **Single-host cluster.** Crimson is designed for many-host
-   scale-out, where pinned reactor cores don't compete with VM,
-   hypervisor, or networking on the same box. On a single host the
-   resource cost of pinning looks bigger than it would in production.
-2. **One run per cell.** No replication of measurements; the ±5–10 %
-   IOPS noise typical of fio runs is an unverified assumption here.
-3. **Per-job runtime of 30 s** is long enough for IOPS to stabilise
-   on this hardware (verified by ramp_time-only-vs-with-runtime
-   spot-checks) but short relative to the time it takes some
-   workloads to reach steady state under journal-trim or rocksdb-
-   compaction pressure.
+- Single trial per cell. ~5 % run-to-run variance on warm reads,
+  more on writes. Headline numbers are single-shot.
+- One host, one NVMe. Replication and CRUSH are OSD-level, not
+  host-level; this is a per-node engine comparison, not a cluster study.
+- `-O2`, not `-O3`. Absolute ceilings sit below an `-O3` build for
+  both backends; the comparison between them is still apples-to-apples.
 
 ### 2.4 Config verified at runtime, not just set
 
-For each phase, after the OSDs restarted, the actual reactor
-affinities were spot-checked from the live process tree before
-starting fio:
+Each phase's CPU layout and log levels were read back from the running
+daemons (`ceph daemon osd.N config get …`, `taskset -cp`, per-reactor
+thread affinity) rather than trusted from `ceph.conf`:
 
-```
-ps -opid,psr,comm,args -e | grep ceph-osd-crimson | awk '/--id/{print $1,$2}' | sort -u
-```
+- crimson-12pin: `crimson_cpu_set` effective per OSD; reactor threads
+  confirmed on cores 0-3 / 4-7 / 8-11.
+- `debug_seastore*` confirmed at the `0/5` default (trace-level seastore
+  logging is on the I/O path and is left off).
+- `crimson_poll_mode` **off** — pidstat shows event-driven %CPU (drops
+  to ~2 % in inter-job gaps), not a poll-loop floor.
 
-`PSR` (the kernel-scheduled CPU the thread was last on) should land
-inside the configured `crimson_cpu_set` for `crimson-12pin`, or
-anywhere in 0-11 for `crimson-12nopin`, or anywhere in 0-11 for
-`classic-12share`. Mismatches with the intended config (most often:
-a stale OSD that didn't pick up the new `cpu_set`) were caught here
-and the phase was restarted.
+---
 
 ## 3. Results — matched 12-core CPU budget
 
-Same 12-core CPU budget on both sides. Reactor count held constant
-for the two crimson runs so that pinning vs no-pinning is isolated
-as the only variable that differs between them.
+Same 12-core CPU budget on both sides: classic's 3 OSDs share cores
+0-11; crimson's 3 OSDs get 4 pinned reactors each (12 reactors over the
+same 12 cores).
 
 ### 3.1 Setup
 
@@ -152,307 +121,273 @@ as the only variable that differs between them.
 |---|---|---|---|
 | **classic-12share** | `ceph-osd-classic` | BlueStore | systemd `CPUAffinity=0-11` shared by all 3 OSDs (default 16-thread NVMe pool per OSD, all contending in the 12-core pool) |
 | **crimson-12pin** | `ceph-osd-crimson` | SeaStore (segment manager) | per-OSD `crimson_cpu_set`: osd.0→0-3, osd.1→4-7, osd.2→8-11 (4 reactors pinned per OSD) |
-| **crimson-12nopin** | `ceph-osd-crimson` | SeaStore (segment manager) | cluster-wide `crimson_cpu_num=4` (4 reactors per OSD, kernel-scheduled) + `CPUAffinity=0-11` so reactors stay in the 12-core pool |
 
-Common to all 3 phases:
+Common to both phases:
 - 3 OSDs, all on the same NVMe (`/dev/nvme1n1p{1,2,3}`).
-- VM 9001 pinned to cores 16-23 (`qm set 9001 --affinity 16-23`) so
-  the load generator does not compete with the OSDs.
-- Same fio matrix on `/dev/sdb`: 4 workloads × 6 iodepths × 4
-  numjobs = 96 cells per phase. `runtime=30, ramp_time=5`.
-- Same captures: pidstat -u -r -p (per-process), pidstat -t (per
-  thread, catches per-reactor CPU%), mpstat -P ALL (per-core), plus
-  /proc/PID/status `VmPeak/HWM/RSS` + `dump_mempools` every 60 s.
+- Same fio matrix on `/dev/sdb`: 96 cells. `runtime=30, ramp_time=5`.
+- Same captures (pidstat per-process/per-thread, mpstat per-core,
+  `/proc/PID/status` every 60 s).
 
-### 3.2 Headline numbers (IOPS at the peak of each workload)
+### 3.2 Headline numbers (peak of each workload)
 
-| Workload | classic-12share | crimson-12pin | crimson-12nopin |
+| Workload | classic-12share | crimson-12pin | 12pin vs classic |
 |---|---:|---:|---:|
-| 4K randread (qd=16, nj=64) | **299.9k** | 249.9k (−17%) | 75.2k (−75%) |
-| 4K randread (qd=32, nj=64) | 299.1k | 253.6k | 74.6k |
-| 4K randwrite (qd=32, nj=32) | **16.4k** | 4.4k (−73%) | 3.8k (−77%) |
-| 4K randwrite (qd=32, nj=64) | 16.7k | 4.2k | 3.8k |
-| 64K seqread (qd=4, nj=32) | **9.4k MB/s** | 1.5k MB/s (−84%) | 2.1k MB/s (−78%) |
-| 64K seqwrite (qd=4, nj=64) | **721 MB/s** | 96 MB/s (−87%) | 113 MB/s (−84%) |
+| 4 KiB random read (peak) | **210.1k** IOPS | 164.3k IOPS | -22% |
+| 4 KiB random write (peak) | **17.0k** IOPS | 8.6k IOPS | -49% |
+| 64 KiB seq read (peak) | **9,392** MB/s | 9,065 MB/s | -3% |
+| 64 KiB seq write (peak) | **712** MB/s | 287 MB/s | -60% |
 
-### 3.3 Did pinning matter? (crimson-12pin vs crimson-12nopin)
+**Author-spec single point** (4 K randwrite, QD20, numjobs=1, 180 s):
 
-Same reactor count (4 per OSD = 12 total), same 12-core pool. Only
-difference is whether reactors are nailed to specific cores.
+| | classic-12share | crimson-12pin |
+|---|---:|---:|
+| IOPS | 3,709 | **4,628** |
+| mean lat | 5,391µs | **4,320µs** |
 
-**Yes, pinning helps — substantially, on most workloads:**
+The author-spec runs on a freshly prefilled store; the 96-job matrix runs
+after the read sweep and accumulated writes have aged it. For SeaStore this
+gap is decisive: the author-spec 4,628 IOPS at qd20-nj1 sits well above
+its matrix neighbours at nj=1 (1.1k at qd16, 1.7k at qd32), so the
+author point is a fresh-store transient, not a point on the QD curve.
+Classic interpolates cleanly (3,709, between qd16=2.9k and qd32=5.7k) —
+BlueStore write throughput does not degrade with store age. The matrix
+rows below reflect aged-store steady state for both.
 
-| Workload (peak) | pin | nopin | pin / nopin |
-|---|---:|---:|---:|
-| 4K randread qd16 nj64 | 249.9k | 75.2k | **3.3×** |
-| 4K randread qd4 nj4 | 155.3k | 48.8k | **3.2×** |
-| 64K seqread qd1 nj1 | 259 MB/s | 223 MB/s | 1.2× |
-| 64K seqread qd16 nj4 | 1303 MB/s | 1500 MB/s | 0.87× |
-| 4K randwrite qd32 nj32 | 4.4k | 3.8k | 1.16× |
-| 4K randwrite qd16 nj4 | 4.3k | 3.3k | 1.30× |
-| 64K seqwrite qd4 nj32 | 278 MB/s | 267 MB/s | 1.04× |
+### 3.3 Does crimson outperform classic at matched resources?
 
-Pinning is a big win for random reads (3×) and a marginal win on
-writes. The reviewer's hypothesis — *"pinning didn't matter, you just
-gave it more cores than before"* — is **partially refuted**: at the
-same reactor count and same 12-core pool, pinning still wins
-materially on the workloads where crimson is competitive at all
-(reads). On writes the cliff dominates and pinning vs no-pinning
-matters less.
+- 4 K random read: classic peaks at 210.1k IOPS, crimson at 164.3k (−22%).
+  They track at low QD; classic pulls ahead at high concurrency.
+- 4 K random write: classic leads every aged-store matrix cell — peak 17.0k
+  vs 8.6k, and at nj=1 classic runs 2.9k/5.7k at qd16/qd32 vs crimson's
+  1.1k/1.7k. SeaStore write throughput falls as the store ages (see [§3.2](#32-headline-numbers-peak-of-each-workload));
+  BlueStore does not.
+- 64 K seq read: near parity at peak — classic 9,392 MB/s vs 9,065 MB/s.
+  At ≈9 GB/s both are largely cache-served; the gap reflects the stack, not
+  the engine.
+- 64 K seq write: classic 712 MB/s vs 287 MB/s (2.5×), the widest backend
+  gap.
 
-### 3.4 Does crimson outperform classic at matched resources?
+With CPU equalized, crimson is within 20–30% of classic on random reads and
+within 3% on sequential reads. On writes, classic leads by 2–2.5× on the
+aged-store matrix, and SeaStore's write throughput degrades with store age
+in a way BlueStore's does not.
 
-**No, not in this snapshot, on this single-host setup.**
-
-**Reads (4K random and 64K sequential):**
-At QD-low / low concurrency: classic and crimson-pin track each
-other. At the peak (qd=16 nj=64): classic 300k IOPS, crimson-pin 250k
-IOPS — classic +20%. At sequential read peak: classic 9.4 GB/s vs
-crimson-pin 1.5 GB/s — classic is **6×** faster.
-
-**Writes (4K random and 64K sequential):**
-classic dominates by **3–10×** across the board, with much lower p99
-latency. At the QD32 nj64 corner, classic-12share writes p99 at
-287 ms vs crimson-pin at 1.65 s — almost 6× worse tail for crimson.
-
-### 3.5 Full matrix tables
+### 3.4 Full matrix tables
 
 #### 4 KiB random read — IOPS
 
-| iodepth \ numjobs | classic | crimson-pin | crimson-nopin |
-|---|---|---|---|
-| qd=1 nj=1 | 16.1k | 16.2k | 7.4k |
-| qd=1 nj=4 | 48.2k | 45.0k | 20.1k |
-| qd=1 nj=32 | 148.8k | 145.4k | 56.5k |
-| qd=1 nj=64 | 147.3k | 154.6k | 66.5k |
-| qd=4 nj=1 | 62.7k | 57.4k | 25.1k |
-| qd=4 nj=4 | 134.9k | 155.3k | 48.8k |
-| qd=4 nj=32 | 196.3k | 206.2k | 72.1k |
-| qd=4 nj=64 | 237.7k | 241.4k | 73.6k |
-| qd=16 nj=1 | 66.4k | 58.8k | 54.5k |
-| qd=16 nj=4 | 215.6k | 224.0k | 72.5k |
-| qd=16 nj=32 | 296.9k | 254.5k | 76.0k |
-| qd=16 nj=64 | 299.9k | 249.9k | 75.2k |
-| qd=32 nj=1 | 66.2k | 59.0k | 61.4k |
-| qd=32 nj=4 | 196.3k | 260.8k | 78.6k |
-| qd=32 nj=32 | 297.9k | 245.6k | 76.3k |
-| qd=32 nj=64 | 299.1k | 253.6k | 74.6k |
+| iodepth \ numjobs | classic | crimson-pin |
+|---|---|---|
+| qd=1 nj=1 | 9.2k | 7.6k |
+| qd=1 nj=4 | 34.3k | 28.1k |
+| qd=1 nj=32 | 120.9k | 92.9k |
+| qd=1 nj=64 | 153.4k | 132.3k |
+| qd=4 nj=1 | 38.0k | 39.1k |
+| qd=4 nj=4 | 96.3k | 78.0k |
+| qd=4 nj=32 | 190.6k | 131.4k |
+| qd=4 nj=64 | 198.4k | 128.2k |
+| qd=16 nj=1 | 67.6k | 58.2k |
+| qd=16 nj=4 | 174.3k | 140.5k |
+| qd=16 nj=32 | 205.3k | 134.4k |
+| qd=16 nj=64 | 201.8k | 135.7k |
+| qd=32 nj=1 | 68.2k | 59.0k |
+| qd=32 nj=4 | 210.1k | 164.3k |
+| qd=32 nj=32 | 205.7k | 138.2k |
+| qd=32 nj=64 | 201.9k | 138.5k |
 
 #### 4 KiB random read — P99
 
-| iodepth \ numjobs | classic | crimson-pin | crimson-nopin |
-|---|---|---|---|
-| qd=1 nj=1 | 72µs | 84µs | 370µs |
-| qd=1 nj=4 | 113µs | 144µs | 749µs |
-| qd=1 nj=32 | 749µs | 569µs | 3.4ms |
-| qd=1 nj=64 | 3.4ms | 929µs | 7.0ms |
-| qd=4 nj=1 | 79µs | 105µs | 724µs |
-| qd=4 nj=4 | 264µs | 301µs | 1.8ms |
-| qd=4 nj=32 | 4.2ms | 1.9ms | 14.5ms |
-| qd=4 nj=64 | 5.9ms | 3.4ms | 18.5ms |
-| qd=16 nj=1 | 257µs | 382µs | 1.7ms |
-| qd=16 nj=4 | 3.2ms | 1.0ms | 5.9ms |
-| qd=16 nj=32 | 7.2ms | 5.8ms | 25.3ms |
-| qd=16 nj=64 | 15.3ms | 12.1ms | 50.6ms |
-| qd=32 nj=1 | 518µs | 651µs | 2.6ms |
-| qd=32 nj=4 | 3.5ms | 1.9ms | 13.4ms |
-| qd=32 nj=32 | 14.5ms | 12.1ms | 44.8ms |
-| qd=32 nj=64 | 33.8ms | 31.9ms | 89.7ms |
+| iodepth \ numjobs | classic | crimson-pin |
+|---|---|---|
+| qd=1 nj=1 | 131µs | 253µs |
+| qd=1 nj=4 | 175µs | 293µs |
+| qd=1 nj=32 | 553µs | 1.2ms |
+| qd=1 nj=64 | 1.3ms | 3.2ms |
+| qd=4 nj=1 | 148µs | 259µs |
+| qd=4 nj=4 | 297µs | 618µs |
+| qd=4 nj=32 | 2.4ms | 7.2ms |
+| qd=4 nj=64 | 4.1ms | 11.5ms |
+| qd=16 nj=1 | 293µs | 618µs |
+| qd=16 nj=4 | 922µs | 2.0ms |
+| qd=16 nj=32 | 7.0ms | 15.1ms |
+| qd=16 nj=64 | 18.0ms | 22.4ms |
+| qd=32 nj=1 | 537µs | 782µs |
+| qd=32 nj=4 | 2.0ms | 6.1ms |
+| qd=32 nj=32 | 16.6ms | 24.2ms |
+| qd=32 nj=64 | 35.4ms | 41.7ms |
 
 #### 4 KiB random write — IOPS
 
-| iodepth \ numjobs | classic | crimson-pin | crimson-nopin |
-|---|---|---|---|
-| qd=1 nj=1 | 279 | 140 | 199 |
-| qd=1 nj=4 | 702 | 550 | 465 |
-| qd=1 nj=32 | 5.9k | 4.6k | 3.4k |
-| qd=1 nj=64 | 10.2k | 4.9k | 3.8k |
-| qd=4 nj=1 | 768 | 729 | 515 |
-| qd=4 nj=4 | 3.0k | 3.0k | 2.0k |
-| qd=4 nj=32 | 16.7k | 5.0k | 3.7k |
-| qd=4 nj=64 | 16.8k | 4.6k | 4.0k |
-| qd=16 nj=1 | 3.1k | 2.8k | 2.2k |
-| qd=16 nj=4 | 10.2k | 4.3k | 3.3k |
-| qd=16 nj=32 | 16.8k | 4.3k | 3.7k |
-| qd=16 nj=64 | 16.7k | 4.2k | 3.4k |
-| qd=32 nj=1 | 5.8k | 3.8k | 2.8k |
-| qd=32 nj=4 | 16.8k | 4.7k | 3.7k |
-| qd=32 nj=32 | 16.4k | 4.4k | 3.8k |
-| qd=32 nj=64 | 16.7k | 4.2k | 3.8k |
+| iodepth \ numjobs | classic | crimson-pin |
+|---|---|---|
+| qd=1 nj=1 | 349 | 261 |
+| qd=1 nj=4 | 754 | 772 |
+| qd=1 nj=32 | 5.8k | 5.9k |
+| qd=1 nj=64 | 10.2k | 7.5k |
+| qd=4 nj=1 | 755 | 773 |
+| qd=4 nj=4 | 3.0k | 4.1k |
+| qd=4 nj=32 | 16.9k | 8.4k |
+| qd=4 nj=64 | 16.6k | 8.5k |
+| qd=16 nj=1 | 2.9k | 1.1k |
+| qd=16 nj=4 | 10.1k | 2.1k |
+| qd=16 nj=32 | 16.7k | 2.4k |
+| qd=16 nj=64 | 16.4k | 2.4k |
+| qd=32 nj=1 | 5.7k | 1.7k |
+| qd=32 nj=4 | 16.8k | 2.4k |
+| qd=32 nj=32 | 16.4k | 2.3k |
+| qd=32 nj=64 | 16.6k | 2.3k |
 
 #### 4 KiB random write — P99
 
-| iodepth \ numjobs | classic | crimson-pin | crimson-nopin |
-|---|---|---|---|
-| qd=1 nj=1 | 5.4ms | 9.4ms | 7.3ms |
-| qd=1 nj=4 | 11.7ms | 19.8ms | 16.4ms |
-| qd=1 nj=32 | 8.6ms | 21.4ms | 26.9ms |
-| qd=1 nj=64 | 11.1ms | 56.4ms | 54.3ms |
-| qd=4 nj=1 | 7.2ms | 13.0ms | 14.5ms |
-| qd=4 nj=4 | 8.2ms | 15.4ms | 18.7ms |
-| qd=4 nj=32 | 14.5ms | 179.3ms | 304.1ms |
-| qd=4 nj=64 | 34.3ms | 283.1ms | 450.9ms |
-| qd=16 nj=1 | 8.6ms | 19.8ms | 19.3ms |
-| qd=16 nj=4 | 11.2ms | 95.9ms | 84.4ms |
-| qd=16 nj=32 | 88.6ms | 608.2ms | 1283.5ms |
-| qd=16 nj=64 | 108.5ms | 885.0ms | 1887.4ms |
-| qd=32 nj=1 | 9.4ms | 35.9ms | 39.6ms |
-| qd=32 nj=4 | 13.4ms | 221.2ms | 254.8ms |
-| qd=32 nj=32 | 116.9ms | 750.8ms | 1585.4ms |
-| qd=32 nj=64 | 287.3ms | 1652.6ms | 2634.0ms |
+| iodepth \ numjobs | classic | crimson-pin |
+|---|---|---|
+| qd=1 nj=1 | 4.0ms | 5.5ms |
+| qd=1 nj=4 | 7.3ms | 10.2ms |
+| qd=1 nj=32 | 8.8ms | 15.8ms |
+| qd=1 nj=64 | 11.2ms | 29.5ms |
+| qd=4 nj=1 | 7.2ms | 10.0ms |
+| qd=4 nj=4 | 8.4ms | 9.8ms |
+| qd=4 nj=32 | 14.0ms | 66.8ms |
+| qd=4 nj=64 | 35.9ms | 111.7ms |
+| qd=16 nj=1 | 8.6ms | 34.9ms |
+| qd=16 nj=4 | 10.6ms | 107.5ms |
+| qd=16 nj=32 | 90.7ms | 717.2ms |
+| qd=16 nj=64 | 124.3ms | 876.6ms |
+| qd=32 nj=1 | 9.0ms | 55.8ms |
+| qd=32 nj=4 | 14.1ms | 227.5ms |
+| qd=32 nj=32 | 128.5ms | 960.5ms |
+| qd=32 nj=64 | 278.9ms | 1887.4ms |
 
 #### 64 KiB seq read — BW_MBS
 
-| iodepth \ numjobs | classic | crimson-pin | crimson-nopin |
-|---|---|---|---|
-| qd=1 nj=1 | 384 | 259 | 223 |
-| qd=1 nj=4 | 1649 | 791 | 898 |
-| qd=1 nj=32 | 6135 | 1348 | 1824 |
-| qd=1 nj=64 | 8488 | 1303 | 1767 |
-| qd=4 nj=1 | 750 | 480 | 478 |
-| qd=4 nj=4 | 2445 | 1079 | 1209 |
-| qd=4 nj=32 | 9445 | 1501 | 2085 |
-| qd=4 nj=64 | 9237 | 988 | 1857 |
-| qd=16 nj=1 | 889 | 571 | 592 |
-| qd=16 nj=4 | 3111 | 1303 | 1500 |
-| qd=16 nj=32 | 5854 | 1055 | 1882 |
-| qd=16 nj=64 | 6787 | 799 | 1703 |
-| qd=32 nj=1 | 1253 | 671 | 689 |
-| qd=32 nj=4 | 4242 | 1401 | 1593 |
-| qd=32 nj=32 | 5714 | 996 | 1843 |
-| qd=32 nj=64 | 6347 | 845 | 1667 |
+| iodepth \ numjobs | classic | crimson-pin |
+|---|---|---|
+| qd=1 nj=1 | 309 | 251 |
+| qd=1 nj=4 | 1,205 | 1,249 |
+| qd=1 nj=32 | 3,770 | 4,277 |
+| qd=1 nj=64 | 5,796 | 5,017 |
+| qd=4 nj=1 | 510 | 520 |
+| qd=4 nj=4 | 1,633 | 1,020 |
+| qd=4 nj=32 | 6,275 | 5,247 |
+| qd=4 nj=64 | 7,318 | 6,292 |
+| qd=16 nj=1 | 573 | 584 |
+| qd=16 nj=4 | 2,048 | 1,353 |
+| qd=16 nj=32 | 8,849 | 8,166 |
+| qd=16 nj=64 | 9,233 | 9,065 |
+| qd=32 nj=1 | 867 | 523 |
+| qd=32 nj=4 | 2,784 | 1,857 |
+| qd=32 nj=32 | 9,392 | 9,063 |
+| qd=32 nj=64 | 7,045 | 8,826 |
 
 #### 64 KiB seq read — P99
 
-| iodepth \ numjobs | classic | crimson-pin | crimson-nopin |
-|---|---|---|---|
-| qd=1 nj=1 | 214µs | 602µs | 724µs |
-| qd=1 nj=4 | 205µs | 1.4ms | 1.3ms |
-| qd=1 nj=32 | 460µs | 13.4ms | 6.5ms |
-| qd=1 nj=64 | 2.9ms | 35.4ms | 19.0ms |
-| qd=4 nj=1 | 423µs | 1.7ms | 1.7ms |
-| qd=4 nj=4 | 602µs | 4.9ms | 4.0ms |
-| qd=4 nj=32 | 3.3ms | 69.7ms | 39.6ms |
-| qd=4 nj=64 | 6.3ms | 135.3ms | 58.5ms |
-| qd=16 nj=1 | 1.6ms | 6.5ms | 5.5ms |
-| qd=16 nj=4 | 2.2ms | 18.0ms | 14.1ms |
-| qd=16 nj=32 | 16.3ms | 173.0ms | 70.8ms |
-| qd=16 nj=64 | 26.6ms | 392.2ms | 120.1ms |
-| qd=32 nj=1 | 2.9ms | 14.1ms | 11.1ms |
-| qd=32 nj=4 | 3.9ms | 39.6ms | 31.9ms |
-| qd=32 nj=32 | 33.4ms | 278.9ms | 95.9ms |
-| qd=32 nj=64 | 63.7ms | 775.9ms | 254.8ms |
+| iodepth \ numjobs | classic | crimson-pin |
+|---|---|---|
+| qd=1 nj=1 | 297µs | 453µs |
+| qd=1 nj=4 | 313µs | 506µs |
+| qd=1 nj=32 | 750µs | 1.8ms |
+| qd=1 nj=64 | 1.8ms | 3.1ms |
+| qd=4 nj=1 | 807µs | 1.3ms |
+| qd=4 nj=4 | 954µs | 1.8ms |
+| qd=4 nj=32 | 2.8ms | 8.5ms |
+| qd=4 nj=64 | 5.7ms | 21.1ms |
+| qd=16 nj=1 | 3.1ms | 5.9ms |
+| qd=16 nj=4 | 3.5ms | 6.6ms |
+| qd=16 nj=32 | 10.9ms | 32.9ms |
+| qd=16 nj=64 | 27.1ms | 63.7ms |
+| qd=32 nj=1 | 5.6ms | 11.5ms |
+| qd=32 nj=4 | 7.1ms | 12.5ms |
+| qd=32 nj=32 | 21.9ms | 63.2ms |
+| qd=32 nj=64 | 75.0ms | 110.6ms |
 
 #### 64 KiB seq write — BW_MBS
 
-| iodepth \ numjobs | classic | crimson-pin | crimson-nopin |
-|---|---|---|---|
-| qd=1 nj=1 | 22 | 13 | 13 |
-| qd=1 nj=4 | 48 | 53 | 43 |
-| qd=1 nj=32 | 275 | 117 | 99 |
-| qd=1 nj=64 | 465 | 48 | 58 |
-| qd=4 nj=1 | 45 | 26 | 25 |
-| qd=4 nj=4 | 141 | 124 | 118 |
-| qd=4 nj=32 | 689 | 278 | 267 |
-| qd=4 nj=64 | 721 | 96 | 113 |
-| qd=16 nj=1 | 156 | 81 | 78 |
-| qd=16 nj=4 | 337 | 266 | 256 |
-| qd=16 nj=32 | 600 | 191 | 199 |
-| qd=16 nj=64 | 708 | 43 | 57 |
-| qd=32 nj=1 | 248 | 127 | 118 |
-| qd=32 nj=4 | 534 | 316 | 301 |
-| qd=32 nj=32 | 677 | 139 | 112 |
-| qd=32 nj=64 | 597 | 127 | 123 |
+| iodepth \ numjobs | classic | crimson-pin |
+|---|---|---|
+| qd=1 nj=1 | 22 | 12 |
+| qd=1 nj=4 | 47 | 65 |
+| qd=1 nj=32 | 252 | 131 |
+| qd=1 nj=64 | 451 | 55 |
+| qd=4 nj=1 | 47 | 35 |
+| qd=4 nj=4 | 147 | 147 |
+| qd=4 nj=32 | 670 | 287 |
+| qd=4 nj=64 | 667 | 168 |
+| qd=16 nj=1 | 66 | 55 |
+| qd=16 nj=4 | 134 | 143 |
+| qd=16 nj=32 | 210 | 61 |
+| qd=16 nj=64 | 233 | 27 |
+| qd=32 nj=1 | 94 | 81 |
+| qd=32 nj=4 | 197 | 202 |
+| qd=32 nj=32 | 218 | 47 |
+| qd=32 nj=64 | 212 | 35 |
 
 #### 64 KiB seq write — P99
 
-| iodepth \ numjobs | classic | crimson-pin | crimson-nopin |
-|---|---|---|---|
-| qd=1 nj=1 | 3.9ms | 11.2ms | 10.9ms |
-| qd=1 nj=4 | 8.7ms | 11.3ms | 16.7ms |
-| qd=1 nj=32 | 13.7ms | 72.9ms | 98.0ms |
-| qd=1 nj=64 | 15.9ms | 263.2ms | 254.8ms |
-| qd=4 nj=1 | 9.2ms | 32.1ms | 30.5ms |
-| qd=4 nj=4 | 13.2ms | 18.2ms | 20.3ms |
-| qd=4 nj=32 | 21.6ms | 152.0ms | 156.2ms |
-| qd=4 nj=64 | 45.4ms | 1199.6ms | 1082.1ms |
-| qd=16 nj=1 | 10.7ms | 54.3ms | 61.6ms |
-| qd=16 nj=4 | 19.8ms | 33.8ms | 33.4ms |
-| qd=16 nj=32 | 143.7ms | 1082.1ms | 759.2ms |
-| qd=16 nj=64 | 135.3ms | 4731.2ms | 4211.1ms |
-| qd=32 nj=1 | 14.0ms | 52.7ms | 63.7ms |
-| qd=32 nj=4 | 22.2ms | 55.8ms | 55.3ms |
-| qd=32 nj=32 | 139.5ms | 1803.6ms | 1786.8ms |
-| qd=32 nj=64 | 534.8ms | 3271.6ms | 3103.8ms |
+| iodepth \ numjobs | classic | crimson-pin |
+|---|---|---|
+| qd=1 nj=1 | 3.8ms | 9.6ms |
+| qd=1 nj=4 | 8.8ms | 10.2ms |
+| qd=1 nj=32 | 14.9ms | 75.0ms |
+| qd=1 nj=64 | 16.9ms | 179.3ms |
+| qd=4 nj=1 | 8.8ms | 11.7ms |
+| qd=4 nj=4 | 12.9ms | 15.5ms |
+| qd=4 nj=32 | 23.2ms | 130.5ms |
+| qd=4 nj=64 | 53.7ms | 801.1ms |
+| qd=16 nj=1 | 28.2ms | 85.5ms |
+| qd=16 nj=4 | 48.0ms | 63.2ms |
+| qd=16 nj=32 | 438.3ms | 2734.7ms |
+| qd=16 nj=64 | 467.7ms | 8556.4ms |
+| qd=32 nj=1 | 36.4ms | 93.8ms |
+| qd=32 nj=4 | 60.0ms | 89.7ms |
+| qd=32 nj=32 | 526.4ms | 4278.2ms |
+| qd=32 nj=64 | 1518.3ms | 9193.9ms |
 
+### 3.5 Per-core CPU use
 
-### 3.6 Per-core CPU use
-
-**Reactor mode**: `crimson_poll_mode` was **not** set in `ceph.conf`
-for any of the three phases, and pidstat-proc confirms event-driven
-behaviour: per-OSD `%CPU` drops to ~2 % during inter-job gaps and
-ramps to ~395 % at peak. Poll-mode would have pinned reactors at
-~400 % continuously regardless of load. So the numbers below reflect
-work actually done, not a poll-loop floor.
+`crimson_poll_mode` was **not** set, and pidstat confirms event-driven
+behaviour: per-OSD `%CPU` drops to a few percent during inter-job gaps
+and ramps under load, rather than sitting at a poll-loop floor.
 
 | Phase | per-OSD %CPU min | max | mean |
 |---|---:|---:|---:|
-| classic-12share | 3 % | 294 % | 85 % |
-| crimson-12pin   | 2 % | 395 % | 212 % |
+| classic-12share | 0 % | 352 % | 83 % |
+| crimson-12pin | 1 % | 399 % | 185 % |
 
-mpstat samples (1 s, full bench duration):
+- classic-12share: the 3 OSDs' worker-thread pools contend in the
+  shared 12-core pool; cores 0-11 run hot under peak read, the rest idle.
+- crimson-12pin: each OSD's 4 reactors stay on their pinned 4-core
+  block; no leakage outside cores 0-11.
 
-- **classic-12share**: cores 0-11 saturate at ~70-95 % under peak
-  randread; 100 % CPU not reached because the 48 worker threads share
-  12 cores and contend on the OSD's `osd_op_tp` queues.
-- **crimson-12pin**: each of the 12 pinned cores hits 100 % during
-  randread peak. Cores 16-23 (VM) at ~25 % each. Beyond the 12 cores,
-  cores 12-15, 24-31 stay near 0 % — no leakage out of the pool.
-- **crimson-12nopin**: 4 of the 12 cores tend to dominate (kernel
-  scheduler concentrates reactors on cooler cores), while the other 8
-  sit at <20 %. The lower throughput vs pinning is consistent with
-  this — the kernel scheduler does not spread the reactors across the
-  pool the way pinning does.
+### 3.6 Memory footprint per OSD (peak RSS)
 
-### 3.7 Memory footprint per OSD (peak RSS)
+Sampled every 60 s from `/proc/PID/status` `VmHWM` (peak resident).
 
-Sampled every 60 s from `/proc/PID/status` `VmPeak/HWM/RSS`. All three
-phases stay flat after warm-up; no growth across the 56-min bench.
-
-| Phase | Peak RSS per OSD (typical) |
+| Phase | Peak RSS per OSD |
 |---|---|
-| classic-12share | ~2.3 GiB |
-| crimson-12pin | ~1.4 GiB |
-| crimson-12nopin | ~1.5 GiB |
+| classic-12share | ~1.8 GiB |
+| crimson-12pin | ~20.3 GiB |
 
-Crimson is ~40 % leaner. Worth a footnote, but not the headline.
+BlueStore is held near its `osd_memory_target` (4 GiB). SeaStore has no
+equivalent cap on this snapshot; its cache grows unconstrained.
 
-### 3.8 What I'd change next time
+### 3.7 What I'd change next time
 
-- **Pin the VM as a hard cgroup constraint** rather than just systemd
-  CPUAffinity — the 25 % bleed I saw during pidstat samples is small
-  enough not to matter, but a cleaner experiment would use cgroup v2
-  `AllowedCPUs=` for both sides.
-- **Run more than one trial per cell.** I see ~5 % run-to-run
-  variance on warm reads, more on writes. The headline numbers are
-  single-trial.
-- **Vary classic's thread pool** to find where it plateaus and what
-  reactor count would beat it. The default 16-threads-per-OSD pool
-  may not be optimal for a 12-core budget either.
-
+- More than one trial per cell — the headline numbers are single-shot.
+- Vary classic's thread-pool size to find where it plateaus under a
+  12-core budget, and what reactor count it takes for crimson to match it.
+- Run a `-O3`-equivalent build (once the crimson `-O3` crash is fixed) to
+  lift both ceilings and re-check whether the ranking holds.
 
 ---
 
+## 4. Visualisation — latency vs throughput
 
-## 4. Visualisation — latency vs throughput across phases
-
-Following the chart style of Ben England's blog post
-*"Crimson SeaStore vs Classic"* on ceph.io — each point is one
-`(iodepth, numjobs)` combination from the 96-job sweep, lines connect
-points within a single backend configuration, both axes log-scaled.
-Curves further to the **upper-left** = better (more throughput at lower
-latency). Generated with `charts/gen-charts.py` from the raw
-`results-matrix.json` of each phase.
+Following the chart style of Ben England's blog post *"Crimson SeaStore
+vs Classic"* on ceph.io — each point is one `(iodepth, numjobs)`
+combination from the 96-job sweep, lines connect points within a single
+backend, both axes log-scaled. Curves further to the **upper-left** =
+better (more throughput at lower latency). Generated with
+`charts/gen-charts.py` from each phase's `results-matrix.json`.
 
 ### 4.1 4 K random read
 
@@ -476,13 +411,11 @@ The fio JSON for each phase lives under `results/`:
 
 - `results/classic-12share/results-matrix.json`
 - `results/crimson-12pin/results-matrix.json`
-- `results/crimson-12nopin/results-matrix.json`
 
-Each JSON carries the full 96-job sweep. `charts/gen-charts.py`
-parses them and produces the four PNGs in `charts/`; re-run it after
-adding new phases to refresh the figures.
+Each JSON carries the full 96-job sweep. `charts/gen-charts.py` parses
+them and produces the four PNGs in `charts/`.
 
 ## Appendix B — exact fio job definitions
 
 `bench-matrix.fio` (96 jobs, 30 s each) is the single workload file
-used across all three phases. See §2.1 for its structure.
+used across both phases. See [§2.1](#21-the-workload) for its structure.
